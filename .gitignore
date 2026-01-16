@@ -1,0 +1,16 @@
+node_modules/
+data/
+.env
+*.log
+client/node_modules/
+client/dist/
+dist/
+.claude/
+.kiro/
+.vscode/
+CLAUDE.md
+AGENTS.md
+intelligent-context-system/*.md
+documents/
+!"documents/Paper: Intelligent Push-Based Context Management (PCM) and Resident Multi-Stream Interactive Agent System.md"
+/*.conf

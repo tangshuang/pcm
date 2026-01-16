@@ -1,0 +1,490 @@
+import { v4 as uuidv4 } from 'uuid';
+import { all, get, run } from '../memory/sqlite.js';
+import { getSessionMessages, getUserMemories, saveCanvasGraph, getCanvasGraph, updateNodePosition } from '../memory/leveldb.js';
+
+export function setupRoutes(app, services) {
+  // Health check
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: Date.now() });
+  });
+
+  // Session management
+  app.get('/api/sessions', async (req, res) => {
+    try {
+      const sessions = await all('SELECT * FROM sessions ORDER BY updated_at DESC');
+      res.json(sessions);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/sessions', async (req, res) => {
+    try {
+      const { userId, title } = req.body;
+      const id = uuidv4();
+      await run(
+        'INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)',
+        [id, userId || 'default', title || 'New Session']
+      );
+      res.json({ id, userId, title });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/sessions/:id/messages', async (req, res) => {
+    try {
+      const messages = await getSessionMessages(req.params.id);
+      res.json(messages);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Get all nodes for a session (for restoring canvas state)
+  app.get('/api/sessions/:id/nodes', async (req, res) => {
+    try {
+      console.log(`\n========== Loading Session Nodes ==========`);
+      console.log(`sessionId: ${req.params.id}`);
+
+      // First try loading from canvas graph
+      const canvasGraph = await getCanvasGraph(req.params.id);
+      console.log(`Canvas graph exists: ${!!canvasGraph}`);
+      if (canvasGraph) {
+        console.log(`Canvas graph node count: ${canvasGraph.nodes?.length || 0}`);
+        console.log(`Canvas graph updated at: ${canvasGraph.updatedAt}`);
+      }
+
+      if (canvasGraph && canvasGraph.nodes && canvasGraph.nodes.length > 0) {
+        console.log(`Loaded ${canvasGraph.nodes.length} nodes from canvas graph`);
+        console.log(`Node ID list: ${canvasGraph.nodes.map(n => n.id).join(', ')}`);
+        console.log(`========== Loading Complete ==========\n`);
+        return res.json(canvasGraph.nodes);
+      }
+
+      // If no canvas graph, build from raw data
+      console.log('Canvas graph does not exist or is empty, building from raw data...');
+      const messages = await getSessionMessages(req.params.id, 200);
+      console.log(`Found ${messages.length} messages`);
+
+      const tasks = await all('SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at ASC', [req.params.id]);
+      console.log(`Found ${tasks.length} tasks`);
+
+      const intents = await all('SELECT * FROM intents WHERE session_id = ? ORDER BY created_at ASC', [req.params.id]);
+      console.log(`Found ${intents.length} intents`);
+      const intentByUserMessageId = new Map(intents.map(i => [i.user_message_id, i]));
+
+      // Convert messages and tasks to node format
+      const nodes = [];
+      let nodeIndex = 0;
+
+      for (const msg of messages) {
+        if (msg.role === 'user') {
+          const relatedIntent = intentByUserMessageId.get(msg.id);
+          const relatedTopics = relatedIntent ? JSON.parse(relatedIntent.related_topics || '[]') : [];
+          nodes.push({
+            id: msg.id,
+            type: 'chat',
+            title: 'User',
+            content: msg.content,
+            timestamp: new Date(msg.timestamp).getTime(),
+            editHistory: msg.editHistory || [],
+            parentNodeId: msg.parentNodeId || null,
+            intentId: relatedIntent?.id,
+            intent: relatedIntent?.intent_type,
+            topic: relatedIntent?.topic,
+            urgency: relatedIntent?.urgency,
+            confidence: relatedIntent?.confidence,
+            relatedTopics,
+            x: 500 + Math.random() * 30 - 15,
+            y: 100 + nodeIndex * 200 + Math.random() * 30 - 15
+          });
+          nodeIndex++;
+        } else if (msg.role === 'assistant') {
+          nodes.push({
+            id: msg.id,
+            type: msg.metadata?.nodeType === 'task_response' ? 'task' : 'chat',
+            title: msg.metadata?.nodeType === 'task_response' ? 'Task Execution' : 'AI Reply',
+            content: msg.content,
+            timestamp: new Date(msg.timestamp).getTime(),
+            messageId: msg.id,
+            editHistory: msg.editHistory || [],
+            parentNodeId: msg.parentNodeId || null,
+            x: 500 + Math.random() * 30 - 15,
+            y: 100 + nodeIndex * 200 + Math.random() * 30 - 15
+          });
+          nodeIndex++;
+        }
+      }
+
+      // Save initial canvas graph
+      if (nodes.length > 0) {
+        await saveCanvasGraph(req.params.id, {
+          nodes,
+          connections: [], // Connections dynamically generated by frontend
+          scale: 1,
+          offset: { x: 0, y: 0 }
+        });
+      }
+
+      console.log(`Returning ${nodes.length} nodes`);
+      res.json(nodes);
+    } catch (err) {
+      console.error('Failed to load nodes:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Save canvas graph state
+  app.post('/api/sessions/:id/canvas', async (req, res) => {
+    try {
+      const { nodes, scale, offset } = req.body;
+      console.log(`Save canvas state: sessionId=${req.params.id}, node count=${nodes?.length || 0}`);
+      if (nodes && nodes.length > 0) {
+        console.log('Node ID list:', nodes.map(n => n.id).join(', '));
+      }
+      await saveCanvasGraph(req.params.id, {
+        nodes,
+        connections: [], // Connections dynamically generated by frontend
+        scale,
+        offset,
+        updatedAt: Date.now()
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error('Failed to save canvas state:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Get canvas state
+  app.get('/api/sessions/:id/canvas', async (req, res) => {
+    try {
+      const canvasGraph = await getCanvasGraph(req.params.id);
+      if (canvasGraph) {
+        res.json(canvasGraph);
+      } else {
+        res.status(404).json({ error: 'Canvas not found' });
+      }
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Update single node position
+  app.patch('/api/sessions/:sessionId/nodes/:nodeId/position', async (req, res) => {
+    try {
+      const { x, y } = req.body;
+      await updateNodePosition(req.params.sessionId, req.params.nodeId, x, y);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Delete nodes (batch delete)
+  app.delete('/api/sessions/:sessionId/nodes', async (req, res) => {
+    try {
+      const { nodeIds } = req.body;
+      const sessionId = req.params.sessionId;
+
+      if (!nodeIds || !Array.isArray(nodeIds) || nodeIds.length === 0) {
+        return res.status(400).json({ error: 'nodeIds is required and must be a non-empty array' });
+      }
+
+      console.log(`Deleting ${nodeIds.length} nodes:`, nodeIds);
+
+      // Delete messages (from LevelDB)
+      for (const nodeId of nodeIds) {
+        const messageKey = `msg:${sessionId}:${nodeId}`;
+        try {
+          await services.leveldb.del(messageKey);
+          console.log(`Deleted message: ${messageKey}`);
+        } catch (err) {
+          // Message may not exist, continue
+          console.log(`Message does not exist: ${messageKey}`);
+        }
+      }
+
+      // Delete intents (from SQLite)
+      for (const nodeId of nodeIds) {
+        try {
+          await run('DELETE FROM intents WHERE id = ?', [nodeId]);
+        } catch (err) {
+          console.log(`Failed to delete intent: ${nodeId}`, err.message);
+        }
+      }
+
+      // Delete tasks (from SQLite)
+      for (const nodeId of nodeIds) {
+        try {
+          await run('DELETE FROM tasks WHERE id = ?', [nodeId]);
+        } catch (err) {
+          console.log(`Failed to delete task: ${nodeId}`, err.message);
+        }
+      }
+
+      // Update canvas graph, remove deleted nodes
+      const canvasGraph = await getCanvasGraph(sessionId);
+      if (canvasGraph && canvasGraph.nodes) {
+        const nodeIdSet = new Set(nodeIds);
+        canvasGraph.nodes = canvasGraph.nodes.filter(n => !nodeIdSet.has(n.id));
+        await saveCanvasGraph(sessionId, canvasGraph);
+        console.log(`Updated canvas graph, ${canvasGraph.nodes.length} nodes remaining`);
+      }
+
+      res.json({ success: true, deletedCount: nodeIds.length });
+    } catch (err) {
+      console.error('Failed to delete nodes:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Task management
+  app.get('/api/tasks', async (req, res) => {
+    try {
+      const { sessionId, status } = req.query;
+      let sql = 'SELECT * FROM tasks WHERE 1=1';
+      const params = [];
+      
+      if (sessionId) {
+        sql += ' AND session_id = ?';
+        params.push(sessionId);
+      }
+      if (status) {
+        sql += ' AND status = ?';
+        params.push(status);
+      }
+      
+      sql += ' ORDER BY created_at DESC';
+      
+      const tasks = await all(sql, params);
+      res.json(tasks);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Subscription management
+  app.get('/api/subscriptions', async (req, res) => {
+    try {
+      const subscriptions = await all('SELECT * FROM subscriptions WHERE status = ?', ['active']);
+      res.json(subscriptions.map(s => ({
+        ...s,
+        config: JSON.parse(s.config)
+      })));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  app.post('/api/subscriptions', async (req, res) => {
+    try {
+      const id = await services.subscriptionManager.addSubscription(req.body);
+      res.json({ id, ...req.body });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  app.delete('/api/subscriptions/:id', async (req, res) => {
+    try {
+      await services.subscriptionManager.removeSubscription(req.params.id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // API polling management
+  app.post('/api/pollers', async (req, res) => {
+    try {
+      const id = await services.apiPoller.addPoller(req.body);
+      res.json({ id, ...req.body });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  app.delete('/api/pollers/:id', async (req, res) => {
+    try {
+      await services.apiPoller.removePoller(req.params.id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Environment events
+  app.get('/api/events', async (req, res) => {
+    try {
+      const { limit = 50, unprocessed } = req.query;
+      let sql = 'SELECT * FROM environment_events';
+      const params = [];
+      
+      if (unprocessed === 'true') {
+        sql += ' WHERE processed = 0';
+      }
+      
+      sql += ' ORDER BY created_at DESC LIMIT ?';
+      params.push(parseInt(limit));
+      
+      const events = await all(sql, params);
+      res.json(events.map(e => ({
+        ...e,
+        data: JSON.parse(e.data)
+      })));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // User memories
+  app.get('/api/users/:userId/memories', async (req, res) => {
+    try {
+      const memories = await getUserMemories(req.params.userId);
+      res.json(memories);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Get intent context (load on demand)
+  app.get('/api/intents/:intentId/context', async (req, res) => {
+    try {
+      const { getIntentContext } = await import('../memory/leveldb.js');
+      const context = await getIntentContext(req.params.intentId);
+      if (!context) {
+        return res.status(404).json({ error: 'Context not found' });
+      }
+      res.json(context);
+    } catch (err) {
+      console.error('Failed to get intent context:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Get intent meta information (structured intent/hints)
+  app.get('/api/intents/:intentId/meta', async (req, res) => {
+    try {
+      const { getIntentMeta } = await import('../memory/leveldb.js');
+      const meta = await getIntentMeta(req.params.intentId);
+      if (!meta) {
+        return res.status(404).json({ error: 'Intent meta not found' });
+      }
+      res.json(meta);
+    } catch (err) {
+      console.error('Failed to get intent meta:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Get context requirement specification (CRS)
+  app.get('/api/intents/:intentId/spec', async (req, res) => {
+    try {
+      const { getContextSpec } = await import('../memory/leveldb.js');
+      const spec = await getContextSpec(req.params.intentId);
+      if (!spec) {
+        return res.status(404).json({ error: 'Context spec not found' });
+      }
+      res.json(spec);
+    } catch (err) {
+      console.error('Failed to get context spec:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // User profile
+  app.get('/api/users/:userId', async (req, res) => {
+    try {
+      const user = await get('SELECT * FROM user_profiles WHERE id = ?', [req.params.userId]);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      res.json({
+        ...user,
+        preferences: JSON.parse(user.preferences || '{}')
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  app.put('/api/users/:userId', async (req, res) => {
+    try {
+      const { name, preferences } = req.body;
+      await run(
+        'UPDATE user_profiles SET name = ?, preferences = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [name, JSON.stringify(preferences), req.params.userId]
+      );
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Message editing
+  app.post('/api/messages/edit', async (req, res) => {
+    try {
+      const { messageId, newContent, originalContent, timestamp } = req.body;
+      
+      // Save edit history to LevelDB
+      const editHistory = {
+        messageId,
+        originalContent,
+        newContent,
+        timestamp,
+        editedAt: Date.now()
+      };
+
+      await services.leveldb.put(`edit:${messageId}:${Date.now()}`, editHistory);
+
+      // Update original message content
+      const messageKey = await findMessageKey(messageId);
+      if (messageKey) {
+        const message = await services.leveldb.get(messageKey);
+        message.content = newContent;
+        message.editHistory = message.editHistory || [];
+        message.editHistory.push(editHistory);
+        await services.leveldb.put(messageKey, message);
+      }
+      
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Debug endpoint: view all intents
+  app.get('/api/debug/intents', async (req, res) => {
+    try {
+      const intents = await all('SELECT * FROM intents ORDER BY created_at DESC');
+      res.json(intents);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Debug endpoint: view all tasks
+  app.get('/api/debug/tasks', async (req, res) => {
+    try {
+      const tasks = await all('SELECT * FROM tasks ORDER BY created_at DESC');
+      res.json(tasks);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Helper function: find message key
+  async function findMessageKey(messageId) {
+    for await (const [key, value] of services.leveldb.iterator({
+      gte: 'msg:',
+      lte: 'msg:\xFF'
+    })) {
+      if (value.id === messageId) {
+        return key;
+      }
+    }
+    return null;
+  }
+}
