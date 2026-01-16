@@ -41,4 +41,4 @@ You can also use the online website to experience [https://pcm.tangshuang.net](h
 
 ## Paper
 
-[Based on Push-Based Context Management (Push-Context-Management) Intelligent Push-Based Context Management (PCM) System](https://pcm.tangshuang.net/paper)
+[Intelligent Push-Based Context Management (PCM) and Resident Multi-Stream Interactive Agent System](https://pcm.tangshuang.net/paper)

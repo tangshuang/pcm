@@ -41,4 +41,4 @@ pnpm dev
 
 ## 论文
 
-[基于推送式上下文管理（Push-Context-Management）的智能推送式上下文管理（PCM）系统](https://pcm.tangshuang.net/paper)
+[智能推送式上下文管理（PCM）与常驻多流交互Agent系统](https://pcm.tangshuang.net/paper)
