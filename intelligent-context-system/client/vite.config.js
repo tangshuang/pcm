@@ -6,6 +6,9 @@ const envs = dotenv.config({ path: '../.env' });
 
 export default defineConfig({
   plugins: [react()],
+  build: {  
+    outDir: '../dist',
+  },
   server: {
     port: 3000,
     proxy: {
